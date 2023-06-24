@@ -1,4 +1,4 @@
-import fs from 'node:fs';
+import { WriteStream, createWriteStream } from 'node:fs';
 
 const CRC_TABLE = [
   0, 1996959894, -301047508, -1727442502, 124634137, 1886057615, -379345611,
@@ -78,7 +78,7 @@ interface CentralFileHeader {
 
 export class ZipWriter {
   private readonly _centralFileHeaderList: CentralFileHeader[] = [];
-  private readonly _writer: fs.WriteStream;
+  private readonly _writer: WriteStream;
   private readonly _zip64: boolean;
   private readonly _zipDate: number;
   private readonly _zipTime: number;
@@ -90,7 +90,7 @@ export class ZipWriter {
   private _zip64EndOfCentralDirectoryOffset = 0;
 
   constructor(name: string, zip64 = false) {
-    this._writer = fs.createWriteStream(name, 'binary');
+    this._writer = createWriteStream(name, 'binary');
     this._zip64 = zip64;
 
     const date = new Date();
@@ -120,7 +120,7 @@ export class ZipWriter {
 
     // local file header signature(4)
     const lfh = Buffer.alloc(30);
-    const extra = Buffer.alloc(this._zip64 ? 20 : 0);
+    const extra = Buffer.alloc(this._zip64 ? 28 : 0);
     lfh.writeUint8(0x50, 0);
     lfh.writeUint8(0x4b, 1);
     lfh.writeUint8(0x03, 2);
@@ -154,11 +154,13 @@ export class ZipWriter {
       // zip64 extended information extra field
       extra.writeUint8(0x01, 0);
       extra.writeUint8(0x00, 1);
-      extra.writeUint16LE(16, 2);
-      // original size (4)
-      extra.writeUint32LE(data.length, 4);
-      // compressed size (4)
-      extra.writeUint32LE(data.length, 12);
+      extra.writeUint16LE(24, 2);
+      // original size (8)
+      extra.writeBigUint64LE(BigInt(data.length), 4);
+      // compressed size (8)
+      extra.writeBigUint64LE(BigInt(data.length), 12);
+      // relative header offset (8)
+      extra.writeBigUint64LE(BigInt(this._filePointer), 20);
       this._writer.write(extra);
     }
 
@@ -311,6 +313,5 @@ export class ZipWriter {
     ecd.writeUint16LE(0, 20);
 
     this._writer.write(ecd);
-    this._writer.close();
   }
 }

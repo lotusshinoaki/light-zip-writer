@@ -1,4 +1,9 @@
-import { calcCrc32, getZipDate, getZipTime } from '../src/zip-writer.js';
+import { ZipWriter, calcCrc32, getZipDate, getZipTime } from '../src/zip-writer.js';
+import { exec } from 'node:child_process';
+import { readFile, rm } from 'node:fs/promises';
+import { promisify } from 'node:util';
+
+const _exec = promisify(exec);
 
 describe('crc32', () => {
   // https://opensource.apple.com/source/tcl/tcl-20/tcl_ext/tcllib/tcllib/modules/crc/crc32.test.auto.html
@@ -41,6 +46,49 @@ describe('getZipTime', () => {
   });
 });
 
+function randomByte() {
+  return Math.floor(Math.random() * 256);
+}
+
+function randomBytes() {
+  const buffer = Buffer.alloc(randomByte());
+  for (let i = 0; i < buffer.length; i++) {
+    buffer.writeUint8(randomByte(), i);
+  }
+  return buffer;
+}
+
 describe('ZipWriter', () => {
-  it('get', () => {});
+  it('compress and decompress test', async () => {
+    const zn = process.env.TMPDIR + 'zip-writer-test.zip'
+    const dest = `${process.env.TMPDIR}zip-writer-test`;
+
+    for (let j = 0; j < 100; j++) {
+      await rm(zn, { recursive: true, force: true });
+      // Create random contents zip
+      const zw = new ZipWriter(zn, j >= 50);
+
+      const files = [];
+      try {
+        for (let i = 0; i < (randomByte() + 1); i++) {
+          const name = `${i}.bin`;
+          const data = randomBytes();
+          await zw.writeFile(name, data);
+          files.push({ data, name });
+        }
+      } finally {
+        zw.close();
+      }
+
+      await rm(dest, { recursive: true, force: true });
+      // Extract with unzip
+      await _exec(`python3 scripts/unzip.py ${zn} ${dest}`);
+
+      // Compare with extracted file
+      for (let i = 0; i < files.length; i++) {
+        const data = await readFile(`${dest}/${files[i].name}`);
+        expect(files[i].data).toEqual(data);
+      }
+    }
+  }, 20 * 1000);
 });
