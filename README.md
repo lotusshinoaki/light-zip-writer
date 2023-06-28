@@ -1,8 +1,7 @@
 # light-zip-writer
 
-Create a zip (uncompressed) in one pass.
+Create a zip (uncompressed) demo.
 
-* Minimal memory requirements.
 * ZIP64 compatible.
 
 ## Example
@@ -10,8 +9,8 @@ Create a zip (uncompressed) in one pass.
 ```
 const zw = new ZipWriter('example.zip');
 try {
-  zw.writeFile('a.txt', Buffer.from('aaaaa'));
-  zw.writeFile('b.txt', Buffer.from('bbbbb'));
+  zw.writeFile('a.txt', createReadableStreamFromString('aaaaa'));
+  zw.writeFile('b.txt', createReadableStreamFromString('bbbbb'));
 } finally {
   zw.close();
 }

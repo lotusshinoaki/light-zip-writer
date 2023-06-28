@@ -1,4 +1,5 @@
-import { WriteStream, createWriteStream } from 'node:fs';
+import { ReadableStream, WritableStream } from 'node:stream/web';
+import { TextEncoder } from 'node:util';
 
 const CRC_TABLE = [
   0, 1996959894, -301047508, -1727442502, 124634137, 1886057615, -379345611,
@@ -46,7 +47,7 @@ const CRC_TABLE = [
   -1022587231, 1510334235, 755167117,
 ] as const;
 
-export function calcCrc32(data: Buffer) {
+export function calcCrc32(data: Uint8Array) {
   let crc = 0 ^ -1;
   data.forEach((n) => {
     crc = (crc >>> 8) ^ CRC_TABLE[(crc ^ n) & 0xff];
@@ -70,15 +71,85 @@ export function getZipTime(date: Date) {
   );
 }
 
+async function readAllBytes(rs: ReadableStream<Uint8Array>) {
+  const reader = rs.getReader();
+  try {
+    const chunks: Uint8Array[] = [];
+
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      chunks.push(value);
+    }
+
+    let length = 0;
+    chunks.forEach((n) => { length += n.byteLength; })
+
+    const result = new Uint8Array(length);
+    let offset = 0;
+    chunks.forEach((n) => {
+      result.set(n, offset);
+      offset += n.byteLength;
+    });
+    return result;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+class CustomArrayBuffer {
+  private readonly _bytes: Uint8Array;
+  private readonly _view: DataView;
+
+  constructor(byteLength: number) {
+    this._bytes = new Uint8Array(byteLength);
+    this._view = new DataView(this._bytes.buffer);
+  }
+
+  get length() {
+    return this._bytes.length;
+  }
+
+  setUint8(byteOffset: number, value: number) {
+    this._view.setUint8(byteOffset, value);
+  }
+
+  setUint16(byteOffset: number, value: number) {
+    this._view.setUint16(byteOffset, value, true);
+  }
+
+  setUint32(byteOffset: number, value: number) {
+    this._view.setUint32(byteOffset, value, true);
+  }
+
+  setBigUint64(byteOffset: number, value: bigint) {
+    this._view.setBigUint64(byteOffset, value, true);
+  }
+
+  async writeTo(ws: WritableStream<Uint8Array>) {
+    const writer = ws.getWriter();
+    try {
+      await writer.ready;
+      await writer.write(this._bytes);
+      return;
+    } finally {
+      writer.releaseLock();
+    }
+  }
+}
+
 interface CentralFileHeader {
-  extra: Buffer;
-  header: Buffer;
-  name: string;
+  extra: CustomArrayBuffer;
+  header: CustomArrayBuffer;
+  name: Uint8Array;
 }
 
 export class ZipWriter {
   private readonly _centralFileHeaderList: CentralFileHeader[] = [];
-  private readonly _writer: WriteStream;
+  private readonly _encoder = new TextEncoder();
+  private readonly _ws: WritableStream<Uint8Array>;
   private readonly _zip64: boolean;
   private readonly _zipDate: number;
   private readonly _zipTime: number;
@@ -89,8 +160,8 @@ export class ZipWriter {
   private _filePointer = 0;
   private _zip64EndOfCentralDirectoryOffset = 0;
 
-  constructor(name: string, zip64 = false) {
-    this._writer = createWriteStream(name, 'binary');
+  constructor(ws: WritableStream<Uint8Array>, zip64 = false) {
+    this._ws = ws;
     this._zip64 = zip64;
 
     const date = new Date();
@@ -98,220 +169,232 @@ export class ZipWriter {
     this._zipDate = getZipDate(date);
   }
 
-  close() {
+  async close() {
     if (this._closed) {
       return;
     }
 
-    this._writeCentralDirectory();
+    await this._writeCentralDirectory();
     if (this._zip64) {
-      this._writeZip64EndOfCentralDirectory();
-      this._writeZip64EndOfCentralDirectoryLocator();
+      await this._writeZip64EndOfCentralDirectory();
+      await this._writeZip64EndOfCentralDirectoryLocator();
     }
-    this._writeEndOfCentralDirectory();
-    this._writer.close();
+    await this._writeEndOfCentralDirectory();
     this._closed = true;
   }
 
-  async writeFile(name: string, data: Buffer) {
+  async writeFile(name: string, rs: ReadableStream<Uint8Array>) {
     if (this._closed) {
       throw new Error('ZipWriter already closed');
     }
 
+    const data = await readAllBytes(rs);
+    const utf8Name = this._encoder.encode(name);
+
+    const lfh = new CustomArrayBuffer(30);
+    const extra = new CustomArrayBuffer(this._zip64 ? 28 : 0);
     // local file header signature(4)
-    const lfh = Buffer.alloc(30);
-    const extra = Buffer.alloc(this._zip64 ? 28 : 0);
-    lfh.writeUint8(0x50, 0);
-    lfh.writeUint8(0x4b, 1);
-    lfh.writeUint8(0x03, 2);
-    lfh.writeUint8(0x04, 3);
+    lfh.setUint8(0, 0x50);
+    lfh.setUint8(1, 0x4b);
+    lfh.setUint8(2, 0x03);
+    lfh.setUint8(3, 0x04);
     // version needed to extract (2)
-    lfh.writeUint16LE(this._zip64 ? 45 : 10, 4);
+    lfh.setUint16(4, this._zip64 ? 45 : 10);
     // general purpose bit flag(2)
-    lfh.writeUint16LE(0, 6);
+    lfh.setUint16(6, 0x0800);
     // compression method (2)
-    lfh.writeUint16LE(0, 8);
+    lfh.setUint16(8, 0);
     // last mod file time (2)
-    lfh.writeUint16LE(this._zipTime, 10);
+    lfh.setUint16(10, this._zipTime);
     // last mod file date (2)
-    lfh.writeUint16LE(this._zipDate, 12);
+    lfh.setUint16(12, this._zipDate);
     // crc-32 (4)
     const crc32 = calcCrc32(data);
-    lfh.writeUInt32LE(crc32, 14);
+    lfh.setUint32(14, crc32);
     // compressed size (4)
-    lfh.writeUint32LE(this._zip64 ? 0xffffffff : data.length, 18);
+    lfh.setUint32(18, this._zip64 ? 0xffffffff : data.length);
     // uncompressed size (4)
-    lfh.writeUint32LE(this._zip64 ? 0xffffffff : data.length, 22);
+    lfh.setUint32(22, this._zip64 ? 0xffffffff : data.length);
     // file name length (2)
-    lfh.writeUint16LE(name.length, 26);
+    lfh.setUint16(26, utf8Name.byteLength);
     // extra field length (2)
-    lfh.writeUint16LE(extra.length, 28);
+    lfh.setUint16(28, extra.length);
 
-    this._writer.write(lfh);
-    this._writer.write(name);
-
+    await lfh.writeTo(this._ws);
+    await this._writeBytes(utf8Name);
     if (this._zip64) {
       // zip64 extended information extra field
-      extra.writeUint8(0x01, 0);
-      extra.writeUint8(0x00, 1);
-      extra.writeUint16LE(24, 2);
+      extra.setUint8(0, 0x01);
+      extra.setUint8(1, 0x00);
+      extra.setUint16(2, 24);
       // original size (8)
-      extra.writeBigUint64LE(BigInt(data.length), 4);
+      extra.setBigUint64(4, BigInt(data.length));
+      extra.setBigUint64(4, BigInt(data.length));
       // compressed size (8)
-      extra.writeBigUint64LE(BigInt(data.length), 12);
+      extra.setBigUint64(12, BigInt(data.length));
       // relative header offset (8)
-      extra.writeBigUint64LE(BigInt(this._filePointer), 20);
-      this._writer.write(extra);
+      extra.setBigUint64(20, BigInt(this._filePointer));
+      await extra.writeTo(this._ws);
     }
+    await this._writeBytes(data);
 
-    await new Promise((resolve) => {
-      this._writer.write(data, resolve);
-    });
-
+    const cfh = new CustomArrayBuffer(46);
     // central file header signature (4)
-    const cfh = Buffer.alloc(46);
-    cfh.writeUint8(0x50, 0);
-    cfh.writeUint8(0x4b, 1);
-    cfh.writeUint8(0x01, 2);
-    cfh.writeUint8(0x02, 3);
+    cfh.setUint8(0, 0x50);
+    cfh.setUint8(1, 0x4b);
+    cfh.setUint8(2, 0x01);
+    cfh.setUint8(3, 0x02);
     // version made by (1+1)
-    cfh.writeUint8(this._zip64 ? 45 : 10, 4);
-    cfh.writeUint8(3, 5);
+    cfh.setUint8(4, this._zip64 ? 45 : 10);
+    cfh.setUint8(5, 3);
     // version needed to extract (2)
-    cfh.writeUint16LE(this._zip64 ? 45 : 10, 6);
+    cfh.setUint16(6, this._zip64 ? 45 : 10);
     // general purpose bit flag (2)
-    cfh.writeUint16LE(0, 8);
+    cfh.setUint16(8, 0x0800);
     // compression method (2)
-    cfh.writeUint16LE(0, 10);
+    cfh.setUint16(10, 0);
     // last mod file time (2)
-    cfh.writeUint16LE(this._zipTime, 12);
+    cfh.setUint16(12, this._zipTime);
     // last mod file date (2)
-    cfh.writeUint16LE(this._zipDate, 14);
+    cfh.setUint16(14, this._zipDate);
     // crc-32 (4)
-    cfh.writeUInt32LE(crc32, 16);
+    cfh.setUint32(16, crc32);
     // compressed size (4)
-    cfh.writeUint32LE(this._zip64 ? 0xffffffff : data.length, 20);
+    cfh.setUint32(20, this._zip64 ? 0xffffffff : data.length);
     // uncompressed size (4)
-    cfh.writeUint32LE(this._zip64 ? 0xffffffff : data.length, 24);
+    cfh.setUint32(24, this._zip64 ? 0xffffffff : data.length);
     // file name length (2)
-    cfh.writeUint16LE(name.length, 28);
+    cfh.setUint16(28, utf8Name.length);
     // extra field length (2)
-    cfh.writeUint16LE(extra.length, 30);
+    cfh.setUint16(30, extra.length);
     // file comment length (2)
-    cfh.writeUint16LE(0, 32);
+    cfh.setUint16(32, 0);
     // disk number start (2)
-    cfh.writeUint16LE(0, 34);
+    cfh.setUint16(34, 0);
     // internal file attributes (2)
-    cfh.writeUint16LE(0, 36);
+    cfh.setUint16(36, 0);
     // external file attributes (4)
-    cfh.writeUint32LE(0x1FF << 16, 38); // 0x1FF=0777=rwxrwxrwx
+    cfh.setUint32(38, 0x1FF << 16); // 0x1FF=0777=rwxrwxrwx
     // relative offset of local header (4)
-    cfh.writeUint32LE(this._zip64 ? 0xffffffff : this._filePointer, 42);
-    this._centralFileHeaderList.push({ extra, header: cfh, name });
+    cfh.setUint32(42, this._zip64 ? 0xffffffff : this._filePointer);
+    this._centralFileHeaderList.push({ extra, header: cfh, name: utf8Name });
 
-    this._filePointer += lfh.length + name.length + extra.length + data.length;
+    this._filePointer += lfh.length + utf8Name.length + extra.length + data.length;
   }
 
-  private _writeCentralDirectory() {
+  private async _writeBytes(data: Uint8Array) {
+    const writer = this._ws.getWriter();
+    try {
+      await writer.ready;
+      await writer.write(data);
+      return;
+    } finally {
+      writer.releaseLock();
+    }
+  }
+
+  private async _writeCentralDirectory() {
     if (this._centralFileHeaderList.length === 0) {
       throw new Error('Cannot create an empty zip');
     }
 
     this._centralDirectoryOffset = this._filePointer;
 
-    this._centralFileHeaderList.forEach(({ extra, header, name }) => {
-      this._writer.write(header);
-      this._writer.write(name);
-      this._writer.write(extra);
+    for (const {extra, header, name} of this._centralFileHeaderList) {
+      await header.writeTo(this._ws);
+      await this._writeBytes(name);
+      await extra.writeTo(this._ws);
 
       const writeSize = header.length + name.length + extra.length;
       this._centralDirectorySize += writeSize;
       this._filePointer += writeSize;
-    });
+    }
   }
 
-  private _writeZip64EndOfCentralDirectory() {
+  private async _writeZip64EndOfCentralDirectory() {
     this._zip64EndOfCentralDirectoryOffset = this._filePointer;
 
+    const ecd64 = new CustomArrayBuffer(56);
     // zip64 end of central directory signature (4)
-    const ecd64 = Buffer.alloc(56);
-    ecd64.writeUint8(0x50, 0);
-    ecd64.writeUint8(0x4b, 1);
-    ecd64.writeUint8(0x06, 2);
-    ecd64.writeUint8(0x06, 3);
+    ecd64.setUint8(0, 0x50);
+    ecd64.setUint8(1, 0x4b);
+    ecd64.setUint8(2, 0x06);
+    ecd64.setUint8(3, 0x06);
     // size of zip64 end of central directory (8)
-    ecd64.writeBigUint64LE(BigInt(44), 4);
+    ecd64.setBigUint64(4, BigInt(44));
     // version made by (2)
-    ecd64.writeUint16LE(45, 12);
+    ecd64.setUint16(12, 45);
     // version needed to extract (2)
-    ecd64.writeUint16LE(45, 14);
+    ecd64.setUint16(14, 45);
     // number of this disk (4)
-    ecd64.writeUint32LE(0, 16);
+    ecd64.setUint32(16, 0);
     // number of the disk with the start of the central directory (4)
-    ecd64.writeUint32LE(0, 20);
+    ecd64.setUint32(20, 0);
     // total number of entries in the central directory on this disk (8)
-    ecd64.writeBigUInt64LE(BigInt(this._centralFileHeaderList.length), 24);
+    ecd64.setBigUint64(24, BigInt(this._centralFileHeaderList.length));
     // total number of entries in the central directory (8)
-    ecd64.writeBigUInt64LE(BigInt(this._centralFileHeaderList.length), 32);
+    ecd64.setBigUint64(32, BigInt(this._centralFileHeaderList.length));
     // size of the central directory (8)
-    ecd64.writeBigUInt64LE(BigInt(this._centralDirectorySize), 40);
+    ecd64.setBigUint64(40, BigInt(this._centralDirectorySize));
     // offset of start of central directory with respect to the starting disk number (8)
-    ecd64.writeBigUInt64LE(BigInt(this._centralDirectoryOffset), 48);
+    ecd64.setBigUint64(48, BigInt(this._centralDirectoryOffset));
 
-    this._writer.write(ecd64);
+    await ecd64.writeTo(this._ws);
   }
 
-  private _writeZip64EndOfCentralDirectoryLocator() {
+  private async _writeZip64EndOfCentralDirectoryLocator() {
+    const ecdl = new CustomArrayBuffer(20);
+
     // zip64 end of central directory locator signature (4)
-    const ecdl = Buffer.alloc(20);
-    ecdl.writeUint8(0x50, 0);
-    ecdl.writeUint8(0x4b, 1);
-    ecdl.writeUint8(0x06, 2);
-    ecdl.writeUint8(0x07, 3);
+    ecdl.setUint8(0, 0x50);
+    ecdl.setUint8(1, 0x4b);
+    ecdl.setUint8(2, 0x06);
+    ecdl.setUint8(3, 0x07);
     // number of the disk with the start of the zip64 end of central directory (4)
-    ecdl.writeUint32LE(0, 4);
+    ecdl.setUint32(4, 0);
     // relative offset of the zip64 end of central directory record (8)
-    ecdl.writeBigUInt64LE(BigInt(this._zip64EndOfCentralDirectoryOffset), 8);
+    ecdl.setBigUint64(8, BigInt(this._zip64EndOfCentralDirectoryOffset));
     // total number of disks (4)
-    ecdl.writeUint32LE(0, 16);
+    ecdl.setUint32(16, 0);
 
-    this._writer.write(ecdl);
+    await ecdl.writeTo(this._ws);
   }
 
-  private _writeEndOfCentralDirectory() {
+  private async _writeEndOfCentralDirectory() {
+    const ecd = new CustomArrayBuffer(22);
+
     // end of central dir signature (4)
-    const ecd = Buffer.alloc(22);
-    ecd.writeUint8(0x50, 0);
-    ecd.writeUint8(0x4b, 1);
-    ecd.writeUint8(0x05, 2);
-    ecd.writeUint8(0x06, 3);
+    ecd.setUint8(0, 0x50);
+    ecd.setUint8(1, 0x4b);
+    ecd.setUint8(2, 0x05);
+    ecd.setUint8(3, 0x06);
     // number of this disk (2)
-    ecd.writeUint16LE(this._zip64 ? 0xffff : 0, 4);
+    ecd.setUint16(4, this._zip64 ? 0xffff : 0);
     // number of the disk with the start of the central directory (2)
-    ecd.writeUint16LE(this._zip64 ? 0xffff : 0, 6);
+    ecd.setUint16(6, this._zip64 ? 0xffff : 0);
     // total number of entries in the central directory on this disk (2)
-    ecd.writeUint16LE(
-      this._zip64 ? 0xffff : this._centralFileHeaderList.length,
+    ecd.setUint16(
       8,
+      this._zip64 ? 0xffff : this._centralFileHeaderList.length,
     );
     // total number of entries in the central directory (2)
-    ecd.writeUint16LE(
-      this._zip64 ? 0xffff : this._centralFileHeaderList.length,
+    ecd.setUint16(
       10,
+      this._zip64 ? 0xffff : this._centralFileHeaderList.length,
     );
     // size of the central directory (4)
-    ecd.writeUint32LE(
-      this._zip64 ? 0xffffffff : this._centralDirectorySize,
+    ecd.setUint32(
       12,
+      this._zip64 ? 0xffffffff : this._centralDirectorySize,
     );
     // offset of start of central directory with respect to the starting disk number (4)
-    ecd.writeUint32LE(
-      this._zip64 ? 0xffffffff : this._centralDirectoryOffset,
+    ecd.setUint32(
       16,
+      this._zip64 ? 0xffffffff : this._centralDirectoryOffset,
     );
     // zip file comment length (2)
-    ecd.writeUint16LE(0, 20);
+    ecd.setUint16(20, 0);
 
-    this._writer.write(ecd);
+    await ecd.writeTo(this._ws);
   }
 }
